@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This project is a distributed application example works on AWS.
+  The system sends a notification Email to inquirer when an inquirer sends a request on the API Gateway endpoint.
+
+  Publisher: API Gateway -> Lambda -> DynamoDB -> DynamoDB Streams -> Lambda(DomainEventPublisher) -> SNS
+  Subscriber: SQS -> Lambda(DomainEventSubscriber) -> SES
+
+  If additional flows e.g. "Send an Email to customer support." required, just add subscribers that subscribes "Inquired" Event.
+
+Globals:
+  Function:
+    Timeout: 15
+    Runtime: go1.x
+
+Parameters:
+  SesEmailFrom:
+    Type: String
+
+Resources:
+  # Role
+  UseCaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole"
+  DomainEventSubscriberRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonSESFullAccess"
+  DomainEventPublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonSNSFullAccess"
+ 
+  # Inquiry
+  Inquire:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../out/inquiry/inquire.zip
+      Handler: inquire
+      Events:
+        HttpPost:
+          Type: Api
+          Properties:
+            Path: '/inquiries'
+            Method: post
+      Role: !GetAtt UseCaseRole.Arn
+  Inquired:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "inquiry-inquired"
+      Subscription:
+        - Endpoint: !GetAtt NotifyInquirerOfConfirmationQueue.Arn
+          Protocol: sqs
+  Inquiries:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "Inquiries"
+      AttributeDefinitions:
+        -
+          AttributeName: InquiryID
+          AttributeType: S
+      KeySchema:
+        -
+          AttributeName: InquiryID
+          KeyType: HASH
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "1"
+        WriteCapacityUnits: "1"
+  InquiryEvents:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "InquiryEvents"
+      AttributeDefinitions:
+        -
+          AttributeName: EventID
+          AttributeType: S
+        -
+          AttributeName: InquiryID
+          AttributeType: S
+      KeySchema:
+        -
+          AttributeName: EventID
+          KeyType: HASH
+        -
+          AttributeName: InquiryID
+          KeyType: RANGE
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "1"
+        WriteCapacityUnits: "1"
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+  InquiryEventPublisher:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../out/inquiry/inquiry-event-publisher.zip
+      Handler: inquiry-event-publisher
+      Environment:
+        Variables:
+          INQUIRED_TOPIC_ARN: !Ref Inquired
+      Role: !GetAtt DomainEventPublisherRole.Arn
+  InquiryEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref InquiryEventPublisher
+      MaximumRetryAttempts: 1
+      Qualifier: $LATEST
+  SubscriptionOfInquiryEventPublisher:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: True
+      EventSourceArn: !GetAtt InquiryEvents.StreamArn
+      FunctionName: !GetAtt InquiryEventPublisher.Arn
+      StartingPosition: LATEST
+
+  # Notification
+  NotifyInquirerOfConfirmationQueue:
+    Type: AWS::SQS::Queue
+    Properties: 
+      VisibilityTimeout: 60
+      RedrivePolicy: 
+        deadLetterTargetArn: !GetAtt DLQOfNotifyInquirerOfConfirmationQueue.Arn
+        maxReceiveCount: 2
+  DLQOfNotifyInquirerOfConfirmationQueue: 
+    Type: AWS::SQS::Queue
+  NotifyInquirerOfConfirmationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: NotifyInquirerOfConfirmationQueuePolicy
+        Statement:
+        - Sid: Allow-SNS-SendMessage
+          Effect: Allow
+          Principal: "*"
+          Action:
+          - sqs:SendMessage
+          Resource: !GetAtt NotifyInquirerOfConfirmationQueue.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !Ref Inquired
+      Queues:
+        - !Ref NotifyInquirerOfConfirmationQueue
+  NotifyInquirerOfConfirmation:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../out/notification/notify-inquirer-of-confirmation.zip
+      Handler: notify-inquirer-of-confirmation
+      Role: !GetAtt DomainEventSubscriberRole.Arn      
+      Environment:
+        Variables:
+          SES_REGION: ap-southeast-2
+          SES_EMAIL_FROM: !Ref SesEmailFrom
+  NotifyInquirerOfConfirmationTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      EventSourceArn: !GetAtt NotifyInquirerOfConfirmationQueue.Arn
+      FunctionName: !GetAtt NotifyInquirerOfConfirmation.Arn

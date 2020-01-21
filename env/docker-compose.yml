@@ -1,0 +1,8 @@
+version: '3'
+services:
+  goawscli:
+    build: .
+    image: goawscli
+    volumes:
+      - ../:/go/src
+    tty: true

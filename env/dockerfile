@@ -1,0 +1,16 @@
+FROM golang:alpine
+
+ARG aws_cli_version="1.16.308"
+ARG pip_installer="https://bootstrap.pypa.io/get-pip.py"
+
+RUN apk --update add \
+    python \
+    curl \
+    make \
+    bash \
+    bash-completion \
+    zip
+
+RUN curl ${pip_installer} | python && \
+    pip install awscli==${aws_cli_version}
+
